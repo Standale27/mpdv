@@ -14,7 +14,7 @@ import scipy.signal as signal
 import argparse
 
 SPEED_OF_LIGHT = 2.998e8  # m/s
-LASER_WAVELENGTH = 193391  # nm
+LASER_WAVELENGTH = 193391  # GHz
 
 os.chdir(pathlib.Path(__file__).parent.resolve())
 parser = argparse.ArgumentParser(description='Process PDV data files.')
