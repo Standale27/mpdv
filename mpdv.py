@@ -245,15 +245,23 @@ class specgram_transform():
     def velCalc(self, Sx, ymin, ymax, baselineIndex):
         max_freqs = []
         # Iterate over each time bin in the cropped spectrogram
+        globalMax = np.max(Sx)
+
+        
         for time_bin in Sx.T:
             # Crop the frequency axis to match the spectrogram's cropped region
             cropped_freqAxis = freqAxis[ymin:ymax]
-            max_freqs.append(cropped_freqAxis[np.argmax(time_bin)])
+            if(np.max(time_bin) >= 0.005*globalMax):           # Only consider time bins with significant intensity relative to the global maximum
+                max_freqs.append(cropped_freqAxis[np.argmax(time_bin)])
+            else:
+                max_freqs.append(np.nan)
+                   
         # Adjust the frequency values relative to the baseline frequency
         beatFreq = np.array(max_freqs) - freqAxis[sT.freq_peaks[baselineIndex]]
 
         velocity = beatFreq * SPEED_OF_LIGHT / (2 * LASER_WAVELENGTH)
         #velocity = np.where(velocity == 0, np.nan, velocity)            # Replace zero values with NaN to avoid plotting invalid data
+        #velocity = np.clip(velocity, a_min=-50, a_max=None, out=None)     # Clip negative values to zero
         return velocity
        
     def demux(self, Sx, muxed_signal):
@@ -306,7 +314,7 @@ class specgram_transform():
             # Design a 4th-order Butterworth bandpass filter
             b, a = signal.butter(4, [lower_bound, upper_bound], fs=sE.RATE, btype='bandpass')
             dmx_temp = signal.filtfilt(b, a, mxsig)
-            b, a = signal.iirnotch(freqAxis[sT.freq_peaks[n]]*1e9, Q=100, fs=sE.RATE)       # If notch is too broad, raise the Q value. Default is ~30, >=100 is likely too high
+            b, a = signal.iirnotch(freqAxis[sT.freq_peaks[n]]*1e9, Q=200, fs=sE.RATE)       # If notch is too broad, raise the Q value. Default is ~30, >=100 is likely too high
             dmx_temp = signal.filtfilt(b, a, dmx_temp)
 
             # Replace NaN values in the filtered signal with 0
@@ -365,8 +373,8 @@ if __name__ == '__main__':
         
         for n in range(len(sT.freq_peaks)):
             vel = sT.velCalc(sT.demuxed_fft[n+1], sT.mx_ymins[n], sT.mx_ymaxs[n], n)
-            fM.velAx[n].scatter(np.linspace(sT.mx_xmin, sT.mx_xmax, len(vel)), vel, s=1, label="Velocity (m/s)", color="red")
-            #fM.velAx[n].plot(vel, label="Velocity (m/s)", color="red")
+            #fM.velAx[n].scatter(np.linspace(sT.mx_xmin, sT.mx_xmax, len(vel)), vel, s=1, label="Velocity (m/s)", color="red")
+            fM.velAx[n].plot(vel, label="Velocity (m/s)", color="red")
 
         fM.set_titles(fM.velAx, [f"Velocity for Probe #{n+1}" for n in range(len(sT.freq_peaks))])
         fM.set_axis_labels(fM.velAx, "Time (µs)", "Velocity (m/s)")
