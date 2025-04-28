@@ -71,9 +71,12 @@ class signal_ext():
 class fig_mgr():
     def __init__(self):
         fig = plt.figure(figsize=(8, 8))
-        subfigs = fig.subfigures(2, 1)
-        self.topFig = subfigs[0].subplots(1, 3)
-        self.btmFig = subfigs[1].subplots(1, 1)
+        self.subfigs = fig.subfigures(3, 1)
+
+    def figure_setup(self, ncols):
+        self.rawAx = self.subfigs[0].subplots(1, 1)
+        self.croppedAx = self.subfigs[1].subplots(1, ncols)
+        self.velAx = self.subfigs[2].subplots(1, ncols)
 
     def set_titles(self, axes, titles):
         """
@@ -196,8 +199,9 @@ class specgram_transform():
             b, a = signal.iirnotch(freqAxis[sT.freq_peaks[n]]*1e9, Q=75, fs=sE.RATE)       # If notch is too broad, raise the Q value. Default is ~30, >=100 is likely too high
             self.filtered_signal = signal.filtfilt(b, a, self.filtered_signal)
         self.filtered_signal[np.isnan(self.filtered_signal)] = 0
+        
 
-    def bandpass(self, sig):
+    def bandpass(self, Sx, sig):
         """
         Apply a bandpass filter to the input signal.
         The filter is designed based on detected frequency peaks and cropping parameters.
@@ -207,7 +211,7 @@ class specgram_transform():
         # Calculate the lower and upper frequency bounds for the bandpass filter
         lower_bound = freqAxis[
             np.clip(
-                sT.freq_peaks[0] - (sT.dictSx_dB[2].shape[0] // 100),
+                sT.freq_peaks[0] - (Sx.shape[0] // 100),
                 a_min=0,
                 a_max=None
             )
@@ -215,9 +219,9 @@ class specgram_transform():
 
         upper_bound = freqAxis[
             np.clip(
-                sT.horz_crop_peaks[0][-1] + (sT.dictSx_dB[2].shape[0] // 100),
+                sT.horz_crop_peaks[0][-1] + (Sx.shape[0] // 100),
                 a_min=None,
-                a_max=sT.dictSx_dB[2].shape[0]
+                a_max=Sx.shape[0]
             )
         ] * 1e9  # Convert to Hz
 
@@ -238,124 +242,241 @@ class specgram_transform():
         self.ymin = np.clip((sT.freq_peaks[0]-(Sx_dB.shape[0]//100)), a_min=0, a_max=None, out=None)+1
         self.ymax = np.clip((sT.horz_crop_peaks[0][-1]+(Sx_dB.shape[0]//50)), a_min=None, a_max=Sx_dB.shape[0], out=None)-1
     
-    def velCalc(self):
-        print("stuff")
+    def velCalc(self, Sx, ymin, ymax, baselineIndex):
+        max_freqs = []
+        # Iterate over each time bin in the cropped spectrogram
+        for time_bin in Sx.T:
+            # Crop the frequency axis to match the spectrogram's cropped region
+            cropped_freqAxis = freqAxis[ymin:ymax]
+            max_freqs.append(cropped_freqAxis[np.argmax(time_bin)])
+        # Adjust the frequency values relative to the baseline frequency
+        beatFreq = np.array(max_freqs) - freqAxis[sT.freq_peaks[baselineIndex]]
+
+        velocity = beatFreq * SPEED_OF_LIGHT / (2 * LASER_WAVELENGTH)
+        #velocity = np.where(velocity == 0, np.nan, velocity)            # Replace zero values with NaN to avoid plotting invalid data
+        return velocity
        
+    def demux(self, Sx, muxed_signal):
+        """
+        Separate the signal into multiple frequency components based on detected frequency peaks. Run bandpass and notch on each component then create new dict for cropped, demuxed signals/FFTs.
+        """
+        mxsig = muxed_signal
+
+        self.demuxed_signals = {}
+        self.demuxed_fft = {}
+        self.demuxed_fft_dB = {}
+
+        self.mx_xmin = sT.xmin
+        self.mx_xmax = sT.xmax
+
+        self.mx_ymins = []
+        self.mx_ymaxs = []
+        for n in range(len(sT.freq_peaks)):
+            # Calculate the lower and upper frequency bounds for the bandpass filter
+            lower_bound = freqAxis[
+                np.clip(
+                    sT.freq_peaks[n] - (Sx.shape[0] // 100),
+                    a_min=0,
+                    a_max=None
+                )
+            ] * 1e9
+            if(n == len(sT.freq_peaks)-1):               # If this is the last frequency peak, use the last detected peak for the upper bound
+                upper_bound = freqAxis[
+                    np.clip(
+                        sT.horz_crop_peaks[0][-1] + (Sx.shape[0] // 20),
+                        a_min=None,
+                        a_max=Sx.shape[0]
+                    )
+                ] * 1e9
+                self.mx_ymin = np.clip((sT.freq_peaks[n]- (Sx.shape[0] // 100)), a_min=0, a_max=None, out=None)+1
+                self.mx_ymax = np.clip(sT.horz_crop_peaks[0][-1] + (Sx.shape[0] // 20), a_min=None, a_max=Sx.shape[0], out=None)-1
+            else:                                        # Otherwise, use the next detected peak for the upper bound
+                upper_bound = freqAxis[
+                    np.clip(
+                        sT.freq_peaks[n+1] - (Sx.shape[0] // 20),
+                        a_min=None,
+                        a_max=Sx.shape[0]
+                    )
+                ] * 1e9
+                self.mx_ymin = np.clip((sT.freq_peaks[n]- (Sx.shape[0] // 100)), a_min=0, a_max=None, out=None)+1
+                self.mx_ymax = np.clip((sT.freq_peaks[n+1]- (Sx.shape[0] // 20)), a_min=None, a_max=Sx.shape[0], out=None)-1
+
+            self.mx_ymins.append(self.mx_ymin)
+            self.mx_ymaxs.append(self.mx_ymax)    
+            # Design a 4th-order Butterworth bandpass filter
+            b, a = signal.butter(4, [lower_bound, upper_bound], fs=sE.RATE, btype='bandpass')
+            dmx_temp = signal.filtfilt(b, a, mxsig)
+            b, a = signal.iirnotch(freqAxis[sT.freq_peaks[n]]*1e9, Q=100, fs=sE.RATE)       # If notch is too broad, raise the Q value. Default is ~30, >=100 is likely too high
+            dmx_temp = signal.filtfilt(b, a, dmx_temp)
+
+            # Replace NaN values in the filtered signal with 0
+            dmx_temp[np.isnan(dmx_temp)] = 0
+        
+            # Store the filtered signal in the demuxed_signals dictionary
+            self.demuxed_signals[f"Demuxed_Signal_{n+1}"] = dmx_temp
+
+            test = sT.SFT.spectrogram(dmx_temp)
+            test = test[np.clip(sT.mx_ymin, 0, None):sT.mx_ymax, sT.mx_xmin:sT.mx_xmax]
+            
+            self.demuxed_fft.update({n+1: test})
+            self.demuxed_fft_dB.update({n+1: 10*np.log10(np.fmax(self.demuxed_fft[n+1], 10**-(9)))})
+
+            colors = ['pink', 'red', 'magenta', 'yellow', 'orange']  # Define a list of colors
+            color = colors[n % len(colors)]  # Cycle through colors based on n
+            fM.highlight_roi(
+                fM.rawAx,
+                xmin=sT.mx_xmin, xmax=sT.mx_xmax,
+                ymin=sT.mx_ymin, ymax=sT.mx_ymax,
+                shape=sT.dictSx_dB[2].shape,
+                color=color, label=f'Probe # {n+1}'
+            )
+
+
+
 
 if __name__ == '__main__':
     sE = signal_ext()
     sT = specgram_transform()
     fM = fig_mgr()
 
-    sT.spectrogram(sE.rawSignal[1], 2, 9)       # This will take the intensities present in the time-space data set, run an FFT on it, and output the magnitudes of the frequencies over time to position 2 in the dictionary w/ a power of 9
+    sT.spectrogram(sE.rawSignal[1], 2, 9)       # FFT on intensities, and output magnitudes of frequencies over time to position 2 in the dictionary w/ a power of 9
     sT.autoROI(sT.dictSx[2], sT.dictSx_dB[2])
     numFreqBins = sT.dictSx_dB[2].shape[0] # num rows
     frequencies = np.abs(np.fft.fftfreq(len(sT.win), d=1/sE.RATE))
     freqAxis = np.flip((frequencies / 1e9)[numFreqBins//1:])
 
     print(f"Number of Detected Baselines: {len(sT.freq_peaks)}")
-    for n in range(len(sT.freq_peaks)):
-        print(f"Baseline Frequency # {n+1}: {freqAxis[sT.freq_peaks[n]]:.3F} GHz")
 
-    sT.bandpass(sE.rawSignal[1])
-    sT.notch(sT.filtered_signal)
-
-
-    sT.spectrogram(sT.filtered_signal, 3, 9)
-    sT.autoROI(sT.dictSx[3], sT.dictSx_dB[3])
-    sT.crop(sT.dictSx_dB[3])
-
-    Sx3_dB_cropped = sT.dictSx_dB[3][np.clip(sT.ymin, 0, None):sT.ymax, sT.xmin:sT.xmax]
-    Sx3_cropped = sT.dictSx[3][np.clip(sT.ymin, 0, None):sT.ymax, sT.xmin:sT.xmax]
-
-    fM.display_spectrograms(
-        fM.topFig,
-        [sT.dictSx_dB[2], sT.dictSx_dB[3], Sx3_dB_cropped]
-    )
-
-    # Add a vertical red dashed line at timeAxis = 0 to topFig[1] and topFig[2]
-    time_zero_index = np.argmin(np.abs(sE.timeAxis))  # Find the index closest to timeAxis = 0
-    time_zero_position = time_zero_index / len(sE.timeAxis) * sT.dictSx_dB[2].shape[1]  # Normalize to spectrogram axis
-
-    fM.topFig[1].axvline(x=time_zero_position, color='red', linestyle='--', label='Time = 0')
-
-    # Add legends to indicate the vertical line
-    fM.topFig[1].legend(loc="upper right")
-
-
-
-    num_time_ticks = 10
-    num_freq_ticks = 15
-
-    xp = np.linspace(0, sT.dictSx_dB[2].shape[1], sT.dictSx_dB[2].shape[1])
-    yp = np.linspace(0, sT.dictSx_dB[2].shape[0], sT.dictSx_dB[2].shape[0])
-    tp = np.linspace(sE.timeAxis[0], sE.timeAxis[-1], xp.shape[0])
-    fp = np.linspace(freqAxis[0], freqAxis[-1], yp.shape[0])
-    timeAxesPos = np.linspace(0, sT.dictSx_dB[2].shape[1], num_time_ticks)
-    timeAxesLabels = [f"{val:.0f}" for val in np.interp(timeAxesPos, xp, tp) * 1e6]
-    freqAxesPos = np.linspace(0, sT.dictSx_dB[2].shape[0], num_freq_ticks)
-    freqAxesLabels = [f"{val:.1f}" for val in np.interp(freqAxesPos, yp, fp)]
-
-    # Generate cropped time axis positions and labels
-    timeAxesPos_cropped = np.linspace(0, sT.xmax - sT.xmin, num_time_ticks)
-    timeAxesLabels_cropped = [f"{val:.2f}" for val in np.interp(timeAxesPos_cropped + sT.xmin, xp, tp) * 1e6]
-
-    # Generate cropped frequency axis positions and labels
-    freqAxesPos_cropped = np.linspace(0, sT.ymax - sT.ymin, num_freq_ticks)
-    freqAxesLabels_cropped = [f"{val:.1f}" for val in np.interp(freqAxesPos_cropped + sT.ymin, yp, fp)]
-
-    # Initialize a list to store the maximum frequency indices for each time bin
-    max_freqs = []
-
-    # Iterate over each time bin in the cropped spectrogram
-    for time_bin in Sx3_cropped.T:
-        # Crop the frequency axis to match the spectrogram's cropped region
-        cropped_freqAxis = freqAxis[sT.ymin:sT.ymax]
+    if len(sT.freq_peaks) > 1:               # If more than one baseline frequency is detected, demultiplex the signal
+        fM.figure_setup(len(sT.freq_peaks))  # Create subfigures for each detected frequency peak
+        print("More than one baseline frequency detected. Demultiplexing...")
+        sT.crop(sT.dictSx_dB[2])
+        sT.demux(sT.dictSx_dB[2], sE.rawSignal[1])
+        fM.rawAx.imshow(sT.dictSx_dB[2], cmap='viridis', interpolation='none', origin='lower')
+        fM.display_spectrograms(
+                fM.croppedAx,
+                [sT.demuxed_fft_dB[n] for n in range(1, len(sT.freq_peaks)+1)],
+            )
         
-        # Find the frequency corresponding to the maximum intensity in the current time bin
-        max_freqs.append(cropped_freqAxis[np.argmax(time_bin)])
 
-    # Adjust the frequency values relative to the baseline frequency
-    beatFreq = np.array(max_freqs) - freqAxis[sT.freq_peaks[0]]
+        time_zero_index = np.argmin(np.abs(sE.timeAxis))  # Find the index closest to timeAxis = 0
+        time_zero_position = time_zero_index / len(sE.timeAxis) * sT.dictSx_dB[2].shape[1]  # Normalize to spectrogram axis
+        fM.rawAx.axvline(x=time_zero_position, color='lime', linestyle='--', label='Time = 0')
+        
+        for n in range(len(sT.freq_peaks)):
+            vel = sT.velCalc(sT.demuxed_fft[n+1], sT.mx_ymins[n], sT.mx_ymaxs[n], n)
+            fM.velAx[n].scatter(np.linspace(sT.mx_xmin, sT.mx_xmax, len(vel)), vel, s=1, label="Velocity (m/s)", color="red")
+            #fM.velAx[n].plot(vel, label="Velocity (m/s)", color="red")
 
-    # Convert the frequency shift to velocity (m/s) using the Doppler formula
-    velocity = beatFreq * SPEED_OF_LIGHT / (2 * LASER_WAVELENGTH)
-
-    # Replace zero values with NaN to avoid plotting invalid data
-    velocity = np.where(velocity == 0, np.nan, velocity)
-    
-
-    fM.btmFig.scatter(np.linspace(sT.xmin, sT.xmax, len(velocity)), velocity, s=1, label="Velocity (m/s)", color="red")
+        fM.set_titles(fM.velAx, [f"Velocity for Probe #{n+1}" for n in range(len(sT.freq_peaks))])
+        fM.set_axis_labels(fM.velAx, "Time (µs)", "Velocity (m/s)")
 
 
+        num_time_ticks = 10
+        num_freq_ticks = 15
 
-    
-    fM.set_titles(fM.topFig, ["Raw Signal Spectrogram", "Filtered Signal Spectrogram", "Filtered Signal Spectrogram (Cropped)"])
-    fM.set_axis_labels(fM.topFig, "Time (µs)", "Frequency (GHz)")
-    fM.btmFig.set_title("Velocity over Time")
-    fM.btmFig.set_xlabel("Time (µs)")
-    fM.btmFig.set_ylabel("Velocity (m/s)")
+        xp = np.linspace(0, sT.dictSx_dB[2].shape[1], sT.dictSx_dB[2].shape[1])
+        yp = np.linspace(0, sT.dictSx_dB[2].shape[0], sT.dictSx_dB[2].shape[0])
+        tp = np.linspace(sE.timeAxis[0], sE.timeAxis[-1], xp.shape[0])
+        fp = np.linspace(freqAxis[0], freqAxis[-1], yp.shape[0])
+        timeAxesPos = np.linspace(0, sT.dictSx_dB[2].shape[1], num_time_ticks)
+        timeAxesLabels = [f"{val:.0f}" for val in np.interp(timeAxesPos, xp, tp) * 1e6]
+        freqAxesPos = np.linspace(0, sT.dictSx_dB[2].shape[0], num_freq_ticks)
+        freqAxesLabels = [f"{val:.1f}" for val in np.interp(freqAxesPos, yp, fp)]
+        
+        # Generate cropped time axis positions and labels
+        timeAxesPos_cropped = np.linspace(0, sT.xmax - sT.xmin, num_time_ticks)
+        timeAxesLabels_cropped = [f"{val:.1f}" for val in np.interp(timeAxesPos_cropped + sT.xmin, xp, tp) * 1e6]
 
-    fM.set_ticks(
-        fM.topFig[:2],  # Apply to the first two subplots
-        timeAxesPos, timeAxesLabels,
-        freqAxesPos, freqAxesLabels
-    )
+        # Generate cropped frequency axis positions and labels
+        for n in range(len(sT.freq_peaks)):
+            freqAxesPos_cropped = np.linspace(0, sT.mx_ymaxs[n] - sT.mx_ymins[n], num_freq_ticks)
+            freqAxesLabels_cropped = [f"{val:.1f}" for val in np.interp(freqAxesPos_cropped + sT.mx_ymins[n], yp, fp)]
+            fM.set_ticks(
+                [fM.croppedAx[n]],  # Apply to the cropped spectrograms
+                timeAxesPos_cropped, timeAxesLabels_cropped,
+                freqAxesPos_cropped, freqAxesLabels_cropped
+            )
 
-    fM.set_ticks(
-        [fM.topFig[2]],  # Apply to the cropped subplot
-        timeAxesPos_cropped, timeAxesLabels_cropped,
-        freqAxesPos_cropped, freqAxesLabels_cropped
-    )
 
-    fM.btmFig.set_xticks(timeAxesPos_cropped+sT.xmin)
-    fM.btmFig.set_xticklabels(timeAxesLabels_cropped)
-    fM.highlight_roi(
-        fM.topFig[1],
-        xmin=sT.xmin, xmax=sT.xmax,
-        ymin=sT.ymin, ymax=sT.ymax,
-        shape=sT.dictSx_dB[3].shape,
-        color="lime", label="Auto-ROI"
-    )
+        fM.set_ticks(
+            [fM.rawAx],  # Wrap in a list to ensure compatibility
+            timeAxesPos, timeAxesLabels,
+            freqAxesPos, freqAxesLabels
+        )
 
+        for ax in fM.velAx:
+            ax.set_xticks(timeAxesPos_cropped + sT.xmin)
+            ax.set_xticklabels(timeAxesLabels_cropped)
+
+
+
+
+
+    else:                      # If only one baseline frequency is detected, proceed with single baseline frequency
+        fM.figure_setup(1)
+        print("Proceeding with single baseline frequency.")
+        fM.rawAx.imshow(sT.dictSx_dB[2], cmap='viridis', interpolation='none', origin='lower')
+        sT.bandpass(sT.dictSx_dB[2], sE.rawSignal[1])
+        sT.notch(sT.filtered_signal)
+        sT.spectrogram(sT.filtered_signal, 3, 9)
+        sT.autoROI(sT.dictSx[3], sT.dictSx_dB[3])
+        sT.crop(sT.dictSx_dB[3])
+        Sx3_dB_cropped = sT.dictSx_dB[3][np.clip(sT.ymin, 0, None):sT.ymax, sT.xmin:sT.xmax]
+        Sx3_cropped = sT.dictSx[3][np.clip(sT.ymin, 0, None):sT.ymax, sT.xmin:sT.xmax]
+
+        fM.croppedAx.imshow(Sx3_dB_cropped, cmap='viridis', interpolation='none', origin='lower')
+        
+        # Add a vertical red dashed line at timeAxis = 0 to topFig[1] and topFig[2]
+        time_zero_index = np.argmin(np.abs(sE.timeAxis))  # Find the index closest to timeAxis = 0
+        time_zero_position = time_zero_index / len(sE.timeAxis) * sT.dictSx_dB[2].shape[1]  # Normalize to spectrogram axis
+        fM.rawAx.axvline(x=time_zero_position, color='lime', linestyle='--', label='t=0')
+        fM.rawAx.legend(loc="upper left")
+
+        vel = sT.velCalc(Sx3_cropped, sT.ymin, sT.ymax, 0)
+        fM.velAx.scatter(np.linspace(sT.xmin, sT.xmax, len(vel)), vel, s=1, label="Velocity (m/s)", color="red")
+
+        num_time_ticks = 10
+        num_freq_ticks = 15
+
+        xp = np.linspace(0, sT.dictSx_dB[2].shape[1], sT.dictSx_dB[2].shape[1])
+        yp = np.linspace(0, sT.dictSx_dB[2].shape[0], sT.dictSx_dB[2].shape[0])
+        tp = np.linspace(sE.timeAxis[0], sE.timeAxis[-1], xp.shape[0])
+        fp = np.linspace(freqAxis[0], freqAxis[-1], yp.shape[0])
+        timeAxesPos = np.linspace(0, sT.dictSx_dB[2].shape[1], num_time_ticks)
+        timeAxesLabels = [f"{val:.0f}" for val in np.interp(timeAxesPos, xp, tp) * 1e6]
+        freqAxesPos = np.linspace(0, sT.dictSx_dB[2].shape[0], num_freq_ticks)
+        freqAxesLabels = [f"{val:.1f}" for val in np.interp(freqAxesPos, yp, fp)]
+        
+        # Generate cropped time axis positions and labels
+        timeAxesPos_cropped = np.linspace(0, sT.xmax - sT.xmin, num_time_ticks)
+        timeAxesLabels_cropped = [f"{val:.2f}" for val in np.interp(timeAxesPos_cropped + sT.xmin, xp, tp) * 1e6]
+
+        # Generate cropped frequency axis positions and labels
+        freqAxesPos_cropped = np.linspace(0, sT.ymax - sT.ymin, num_freq_ticks)
+        freqAxesLabels_cropped = [f"{val:.1f}" for val in np.interp(freqAxesPos_cropped + sT.ymin, yp, fp)]
+
+        #fM.set_titles(fM.rawAx, ["Raw Signal Spectrogram", "Filtered Signal Spectrogram", "Filtered Signal Spectrogram (Cropped)"])
+        #fM.set_axis_labels(fM.rawAx, "Time (µs)", "Frequency (GHz)")
+        fM.velAx.set_title("Velocity over Time")
+        fM.velAx.set_xlabel("Time (µs)")
+        fM.velAx.set_ylabel("Velocity (m/s)")
+        
+        
+        fM.set_ticks(
+            [fM.rawAx],  # Apply to the first two subplots
+            timeAxesPos, timeAxesLabels,
+            freqAxesPos, freqAxesLabels
+        )
+        
+        fM.velAx.set_xticks(timeAxesPos_cropped+sT.xmin)
+        fM.velAx.set_xticklabels(timeAxesLabels_cropped)
+        
+        fM.highlight_roi(
+            fM.rawAx,
+            xmin=sT.xmin, xmax=sT.xmax,
+            ymin=sT.ymin, ymax=sT.ymax,
+            shape=sT.dictSx_dB[3].shape,
+            color="orange", label="Auto-ROI"
+        )        
     plt.show()
